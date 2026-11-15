@@ -3,6 +3,13 @@
 What's new
 ##########
 
+v0.7.1 (unreleased)
+-------------------
+
+**New features**
+
+- New synchronized within-subject permutation (randomization) inference for repeated measures. The new configuration object :py:class:`pingouin.WithinPermutation` can be passed to the new keyword-only ``resampling`` argument of :py:func:`pingouin.ttest` (paired samples) and :py:func:`pingouin.pairwise_tests` (single within-subject factor, ``parametric=True``, ``nan_policy='listwise'``). Every resampling round permutes the condition labels of each complete subject independently, and all the pairwise T-statistics are recomputed on the same permuted table, so the comparisons keep their dependence. ``n_resamples='exact'`` enumerates the complete space of :math:`(k!)^n` assignments (capped at 100,000); random mode draws independent rounds and applies the plus-one correction. :py:func:`pingouin.pairwise_tests` also gains the family-wise ``padjust='maxT'`` correction, based on the maximum absolute T-statistic of the whole family of pairs over the same rounds.
+
 v0.7.0 (September 2026)
 -----------------------
 

@@ -1,5 +1,6 @@
 # Import pingouin objects
 from .utils import *
+from .resampling import *
 from .bayesian import *
 from .datasets import *
 from .distribution import *

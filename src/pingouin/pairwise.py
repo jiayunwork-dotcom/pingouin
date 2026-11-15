@@ -11,6 +11,7 @@ from scipy.stats import studentized_range
 from .config import _no_rounding
 from .effsize import compute_effsize
 from .multicomp import _multicomp_triu, multicomp
+from .resampling import _check_resampling, _within_perm_stats
 from .utils import (
     _check_alternative,
     _check_dataframe,
@@ -75,6 +76,66 @@ def _padjust(stats, padjust, alpha=0.05):
     return stats
 
 
+def _pairwise_tests_within_perm(
+    data_piv, within, resampling, alternative, padjust, alpha, effsize, return_desc, col_order
+):
+    """Pairwise tests of a single within factor with synchronized permutation inference.
+
+    ``data_piv`` is the complete-case subject x condition pivot table (listwise deletion,
+    repeated measurements already averaged). Every resampling round permutes the condition
+    labels of each subject independently, and all the pairwise T-statistics — and, for
+    ``padjust='maxT'``, the family maximum absolute T — are recomputed on that same permuted
+    table, so the comparisons keep their dependence. See :py:func:`pairwise_tests`.
+    """
+    levels = list(data_piv.columns)
+    k = len(levels)
+    if k < 2:
+        raise ValueError("Columns must have at least two unique values.")
+    values = data_piv.to_numpy(dtype=np.float64)
+    n = values.shape[0]
+    if n < 2:
+        raise ValueError(f"resampling requires at least two complete subjects, got {n}.")
+    if not np.isfinite(values).all():
+        raise ValueError(f"resampling does not support infinite values in {within}.")
+
+    maxt = isinstance(padjust, str) and padjust.lower() == "maxt"
+    with _no_rounding():  # For max precision
+        res = _within_perm_stats(values, alternative=alternative, resampling=resampling, maxt=maxt)
+        rows = []
+        for j, (a, b) in enumerate(combinations(range(k), 2)):
+            x, y = values[:, a], values[:, b]
+            row = {"Contrast": within, "A": levels[a], "B": levels[b], "Paired": True}
+            if return_desc:
+                row.update(
+                    mean_A=x.mean(),
+                    std_A=x.std(ddof=1),
+                    mean_B=y.mean(),
+                    std_B=y.std(ddof=1),
+                )
+            row["T"] = res["t_obs"][j]
+            row["dof"] = float(n - 1)
+            row["alternative"] = alternative
+            row["p_unc"] = res["p_unc"][j]
+            if maxt:
+                # Family-wise correction over all the pairs, from the same rounds
+                row["p_corr"] = res["p_maxt"][j]
+                row["p_adjust"] = "maxT"
+            row[effsize] = compute_effsize(x=x, y=y, eftype=effsize, paired=True)
+            rows.append(row)
+        stats = pd.DataFrame(rows)
+        if not maxt:
+            # 'none', 'holm', 'bonf', 'fdr_bh', ... applied to the permutation p-values
+            stats = _padjust(stats, padjust=padjust, alpha=alpha)
+    stats["Parametric"] = True
+    stats["resamples"] = res["n_resamples"]
+    stats["exact"] = res["exact"]
+
+    # Reorder and drop empty columns
+    stats = stats[[c for c in col_order if c in stats.columns]]
+    stats = stats.dropna(how="all", axis=1)
+    return stats
+
+
 def _group_arrays(data, by, dv):
     """Values of ``dv`` for each level of ``by``, as a dict of float arrays sorted by level.
 
@@ -110,6 +171,8 @@ def pairwise_tests(
     return_desc=False,
     interaction=True,
     within_first=True,
+    *,
+    resampling=None,
 ):
     """Pairwise tests.
 
@@ -157,6 +220,12 @@ def pairwise_tests(
         * ``'holm'``: step-down method using Bonferroni adjustments
         * ``'fdr_bh'``: Benjamini/Hochberg FDR correction
         * ``'fdr_by'``: Benjamini/Yekutieli FDR correction
+        * ``'maxT'``: family-wise correction based on the maximum absolute T-statistic
+          of the whole family of pairs, computed over the same resampling rounds
+          (requires ``resampling`` and ``alternative='two-sided'``)
+
+        .. versionchanged:: 0.7.1
+            Added the ``'maxT'`` method.
     effsize : string or None
         Effect size type. Available methods are:
 
@@ -197,6 +266,19 @@ def pairwise_tests(
         and between * within otherwise.
 
         .. versionadded:: 0.3.6
+    resampling : None or :py:class:`pingouin.WithinPermutation`
+        Keyword-only. If a :py:class:`pingouin.WithinPermutation` object, the p-values of a
+        single within-subject factor design (one ``within`` factor, ``subject``,
+        ``parametric=True``, no ``between`` factor and ``nan_policy='listwise'``) are computed
+        by synchronized within-subject permutation instead of the parametric T distribution:
+        each resampling round reassigns the values of every complete subject to the condition
+        labels independently, and all the pairwise T-statistics are recomputed on the same
+        permuted table, which keeps the comparisons dependent. The output has no ``BF10``
+        column and instead reports the number of ``resamples`` and whether the space was
+        enumerated ``exact``ly. If None (default), the standard parametric tests are returned
+        unchanged.
+
+        .. versionadded:: 0.7.1
 
     Returns
     -------
@@ -220,10 +302,11 @@ def pairwise_tests(
         * ``'BF10'``: Bayes Factor
         * ``'hedges'``: effect size (or any effect size defined in
           ``effsize``)
+        * ``'resamples'``, ``'exact'``: only when ``resampling`` is used
 
     See also
     --------
-    ttest, mwu, wilcoxon, compute_effsize, multicomp
+    ttest, mwu, wilcoxon, compute_effsize, multicomp, WithinPermutation
 
     Notes
     -----
@@ -256,6 +339,28 @@ def pairwise_tests(
     subject with one or more missing value(s) will be completely removed from the dataframe prior
     to calculating the T-tests. The ``nan_policy`` parameter can therefore have a huge impact
     on the results.
+
+    With ``resampling``, the complete subjects are first selected with the usual listwise
+    deletion, and that same set of subjects then defines the observed statistics, the
+    exchangeable values of every resampling round, and the family of comparisons. Under the
+    joint null hypothesis, the condition labels of a complete subject are exchangeable, so
+    each round applies an independent uniform permutation of the condition labels of every
+    subject. The uncorrected p-value of a pair is the frequency, over all rounds, of
+    T-statistics at least as extreme as the observed one in the direction(s) of
+    ``alternative`` (ties are counted). Random mode draws exactly ``n_resamples`` independent
+    rounds and applies the plus-one correction ``(1 + count) / (1 + n_resamples)``; exact mode
+    enumerates all :math:`(k!)^n` assignments of the :math:`k` condition labels of the
+    :math:`n` complete subjects (capped at 100,000, :py:class:`OverflowError` otherwise) and
+    returns the true proportions, with no correction.
+
+    ``padjust='maxT'`` is a family-wise correction for the whole family of pairs of the
+    within-subject factor: within each resampling round, the maximum absolute T over all the
+    pairs is taken, and the corrected p-value of a pair is the frequency of rounds whose
+    maximum reaches the observed absolute T of that pair. It relies on the joint
+    exchangeability of the condition labels of complete subjects under the complete null
+    hypothesis; it does not claim strong family-wise error control under arbitrary partial
+    null hypotheses or arbitrary time trends. The other corrections (``'holm'``, ``'bonf'``,
+    ``'fdr_bh'``, ...) are applied to the permutation p-values as usual.
 
     Examples
     --------
@@ -332,6 +437,17 @@ def pairwise_tests(
     1     Time   August     January   False        True -1.806  118.0        less  0.037  -0.328
     2     Time   August        June   False        True -2.660  118.0        less  0.004  -0.483
     3     Time  January        June   False        True -0.934  118.0        less  0.176  -0.170
+
+    7. Synchronized within-subject permutation inference with the family-wise maxT correction
+
+    >>> cfg = pg.WithinPermutation(n_resamples=999, seed=42)
+    >>> pg.pairwise_tests(
+    ...     dv="Scores", within="Time", subject="Subject", data=df, resampling=cfg, padjust="maxT"
+    ... ).round(3)
+      Contrast       A       B  Paired  Parametric      T   dof alternative  p_unc  p_corr p_adjust  resamples  exact  hedges
+    0     Time  August  January    True        True -1.740  59.0   two-sided  0.108  0.223     maxT        999  False  -0.328
+    1     Time  August     June    True        True -2.743  59.0   two-sided  0.010  0.026     maxT        999  False  -0.483
+    2     Time January     June    True        True -1.024  59.0   two-sided  0.296  0.564     maxT        999  False  -0.170
     """
     # Safety checks
     data = _check_dataframe(
@@ -376,6 +492,30 @@ def pairwise_tests(
         contrast = "within_between"
         assert between in data.keys() and within in data.keys()
 
+    # Synchronized within-subject permutation inference: check the design and the correction
+    maxt = isinstance(padjust, str) and padjust.lower() == "maxt"
+    if maxt:
+        if resampling is None:
+            raise ValueError("padjust='maxT' requires resampling=pg.WithinPermutation(...).")
+        if alternative != "two-sided":
+            raise ValueError("padjust='maxT' is only supported with alternative='two-sided'.")
+    if resampling is not None:
+        _check_resampling(resampling)
+        if not parametric:
+            raise ValueError("resampling is only supported with parametric=True.")
+        if contrast != "simple_within":
+            raise ValueError(
+                "resampling is only supported for a single within-subject factor, with "
+                "subject and no between-subject factor."
+            )
+        if subject is None:
+            raise ValueError("resampling requires a subject identifier.")
+        if nan_policy != "listwise":
+            raise ValueError(
+                "resampling requires nan_policy='listwise' (complete-case analysis): "
+                "the complete subjects define the exchangeable values of every round."
+            )
+
     # Create col_order
     col_order = [
         "Contrast",
@@ -396,6 +536,8 @@ def pairwise_tests(
         "p_unc",
         "p_corr",
         "p_adjust",
+        "resamples",
+        "exact",
         "BF10",
         effsize,
     ]
@@ -412,6 +554,20 @@ def pairwise_tests(
             # Remove rows (= subject) with missing values. For pairwise deletion, missing values
             # will be removed directly in the lower-level functions (e.g. pg.ttest)
             data_piv = data_piv.dropna()
+        if resampling is not None:
+            # Synchronized permutation of the condition labels of the complete subjects
+            stats = _pairwise_tests_within_perm(
+                data_piv,
+                within=within,
+                resampling=resampling,
+                alternative=alternative,
+                padjust=padjust,
+                alpha=alpha,
+                effsize=effsize,
+                return_desc=return_desc,
+                col_order=col_order,
+            )
+            return _postprocess_dataframe(stats)
         # Stack instead of melt, which fails when a level of the within factor(s) is named as dv
         data = data_piv.stack(list(range(data_piv.columns.nlevels)), future_stack=True)
         data = data.rename(dv).reset_index()

@@ -24,6 +24,7 @@ ANOVA and T-test
     ttest
     sequential_ttest
     ptests
+    WithinPermutation
 
 Bayesian
 --------

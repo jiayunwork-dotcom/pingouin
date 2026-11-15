@@ -9,6 +9,7 @@ from scipy.stats import f
 from .bayesian import bayesfactor_ttest
 from .config import _no_rounding
 from .distribution import _contrast_cov, _gg_epsilon, _mauchly_sphericity
+from .resampling import _check_resampling, _within_perm_stats
 from .utils import (
     _check_alternative,
     _check_dataframe,
@@ -28,7 +29,17 @@ __all__ = [
 ]
 
 
-def ttest(x, y, paired=False, alternative="two-sided", correction="auto", r=0.707, confidence=0.95):
+def ttest(
+    x,
+    y,
+    paired=False,
+    alternative="two-sided",
+    correction="auto",
+    r=0.707,
+    confidence=0.95,
+    *,
+    resampling=None,
+):
     """T-test.
 
     Parameters
@@ -62,6 +73,21 @@ def ttest(x, y, paired=False, alternative="two-sided", correction="auto", r=0.70
         Confidence level for the confidence intervals (0.95 = 95%)
 
         .. versionadded:: 0.3.9
+    resampling : None or :py:class:`pingouin.WithinPermutation`
+        Keyword-only. If a :py:class:`pingouin.WithinPermutation` object, the p-value is
+        computed by within-subject permutation (randomization inference) instead of the
+        parametric T distribution. Only supported for paired samples: ``paired`` must be True
+        and ``x`` and ``y`` must be two one-dimensional numeric samples of equal length with
+        at least two complete pairs (missing values are removed pairwise, other non-finite
+        values are rejected). Each resampling round independently swaps or keeps the two
+        values of every pair, and the T-statistic of the pairwise differences is recomputed;
+        ``'exact'`` enumerates all :math:`2^n` swaps. The output has no ``CI95``, ``BF10`` or
+        ``power`` columns (those are parametric-distribution quantities), and instead reports
+        ``method='within-permutation'``, the number of ``resamples`` and whether the space was
+        enumerated ``exact``ly. ``correction``, ``r`` and ``confidence`` are ignored in that
+        case. If None (default), the standard parametric test is returned unchanged.
+
+        .. versionadded:: 0.7.1
 
     Returns
     -------
@@ -75,10 +101,11 @@ def ttest(x, y, paired=False, alternative="two-sided", correction="auto", r=0.70
         * ``'cohen_d'``: Cohen d effect size
         * ``'power'``: achieved power of the test ( = 1 - type II error)
         * ``'BF10'``: Bayes Factor of the alternative hypothesis
+        * ``'method'``, ``'resamples'``, ``'exact'``: only when ``resampling`` is used
 
     See also
     --------
-    mwu, wilcoxon, anova, rm_anova, pairwise_tests, compute_effsize
+    mwu, wilcoxon, anova, rm_anova, pairwise_tests, compute_effsize, WithinPermutation
 
     Notes
     -----
@@ -127,6 +154,14 @@ def ttest(x, y, paired=False, alternative="two-sided", correction="auto", r=0.70
     The scaled Jeffrey-Zellner-Siow (JZS) Bayes Factor is approximated
     using the :py:func:`pingouin.bayesfactor_ttest` function. It is only provided for two-sided
     tests; the BF value will be set to NaN for one-sided tests.
+
+    With ``resampling``, the p-value is the frequency, over all resampling rounds, of
+    T-statistics at least as extreme as the observed one in the direction(s) of
+    ``alternative`` (ties are counted). Random mode draws exactly ``n_resamples`` independent
+    rounds and applies the plus-one correction ``(1 + count) / (1 + n_resamples)``; exact mode
+    gives the true proportion over all :math:`2^n` swaps, with no correction. All-zero
+    differences give T = 0, and constant non-zero differences give T = +-inf (counted towards
+    the corresponding tail) — no resampling round is ever discarded.
 
     Results have been tested against JASP and the `t.test` R function.
 
@@ -214,6 +249,26 @@ def ttest(x, y, paired=False, alternative="two-sided", correction="auto", r=0.70
     >>> from scipy.stats import ttest_ind
     >>> np.round(ttest_ind(x, y, equal_var=True), 6)  # T value and p-value
     array([1.971859, 0.057056])
+
+    7. Paired T-test with exact within-subject permutation inference.
+
+    >>> import pandas as pd
+    >>> import pingouin as pg
+    >>> pd.set_option("display.expand_frame_repr", False)
+    >>> pd.set_option("display.max_columns", 20)
+    >>> pre = [5.5, 2.4, 6.8, 9.6, 4.2]
+    >>> post = [6.4, 3.4, 6.4, 11.0, 4.8]
+    >>> cfg = pg.WithinPermutation(n_resamples="exact")
+    >>> ttest(pre, post, paired=True, resampling=cfg).round(4)
+               T  dof alternative  p_val             method  resamples  exact  cohen_d
+    T_test -2.3078    4   two-sided  0.125  within-permutation         32   True   0.2508
+
+    The same configuration object can be reused; random mode is reproducible for a given seed.
+
+    >>> cfg = pg.WithinPermutation(n_resamples=999, seed=42)
+    >>> ttest(pre, post, paired=True, alternative="less", resampling=cfg).round(4)
+               T  dof alternative  p_val             method  resamples  exact  cohen_d
+    T_test -2.3078    4        less  0.057  within-permutation        999  False   0.2508
     """
     from scipy.stats import t, ttest_1samp, ttest_ind, ttest_rel
 
@@ -221,6 +276,11 @@ def ttest(x, y, paired=False, alternative="two-sided", correction="auto", r=0.70
 
     # Check arguments
     _check_alternative(alternative)
+    if resampling is not None:
+        # Within-subject permutation (randomization) inference, paired samples only
+        return _ttest_within_permutation(
+            x, y, paired=paired, alternative=alternative, resampling=resampling
+        )
     assert 0 < confidence < 1, "confidence must be between 0 and 1."
 
     x = np.asarray(x)
@@ -330,6 +390,65 @@ def ttest(x, y, paired=False, alternative="two-sided", correction="auto", r=0.70
         stats["BF10"] = bayesfactor_ttest(tval, nx, ny, paired=paired, alternative=alternative, r=r)
 
     # Convert to dataframe
+    stats = pd.DataFrame(stats, index=["T_test"])
+    return _postprocess_dataframe(stats)
+
+
+def _ttest_within_permutation(x, y, paired, alternative, resampling):
+    """Paired T-test with within-subject permutation inference (see :py:func:`ttest`).
+
+    Each resampling round independently swaps or keeps the two values of every pair, and the
+    T-statistic of the pairwise differences is recomputed. The same engine serves
+    :py:func:`pairwise_tests`, so a two-condition ``pairwise_tests`` call on the same complete
+    subjects (in the same order) returns identical T and p-values.
+    """
+    from pingouin import compute_effsize
+
+    _check_resampling(resampling)
+    if not paired:
+        raise ValueError(
+            "resampling requires paired=True: within-subject permutation is only defined "
+            "for paired samples. The design is never switched automatically."
+        )
+    x = np.asarray(x)
+    y = np.asarray(y)
+    if x.ndim != 1 or y.ndim != 1:
+        raise ValueError(
+            "resampling requires two one-dimensional samples: one-sample and "
+            "multi-dimensional tests are not supported."
+        )
+    try:
+        x = x.astype(np.float64)
+        y = y.astype(np.float64)
+    except (TypeError, ValueError):
+        raise ValueError("resampling requires two numeric samples.") from None
+    if x.size != y.size:
+        raise ValueError(
+            "resampling requires two samples of equal length: paired samples are never "
+            "switched to independent samples automatically."
+        )
+    # Pairwise deletion of missing values, then reject any other non-finite value
+    x, y = remove_na(x, y, paired=True)
+    if not (np.isfinite(x).all() and np.isfinite(y).all()):
+        raise ValueError("resampling does not support infinite values in x or y.")
+    n = x.size
+    if n < 2:
+        raise ValueError(f"resampling requires at least two complete pairs, got {n}.")
+
+    res = _within_perm_stats(
+        np.column_stack([x, y]), alternative=alternative, resampling=resampling
+    )
+    d = compute_effsize(x, y, paired=True, eftype="cohen")
+    stats = {
+        "T": res["t_obs"][0],
+        "dof": n - 1,
+        "alternative": alternative,
+        "p_val": res["p_unc"][0],
+        "method": "within-permutation",
+        "resamples": res["n_resamples"],
+        "exact": res["exact"],
+        "cohen_d": abs(d),
+    }
     stats = pd.DataFrame(stats, index=["T_test"])
     return _postprocess_dataframe(stats)
 
