@@ -220,14 +220,21 @@ class TestCorrelation(TestCase):
         pc = partial_corr(data=df, x="x", y="y", x_covar=["cv1", "cv2", "cv3"])
         assert pc.at["pearson", "r"] is not None
 
-        # Issue #375: covariate numerically identical to x or y raises ValueError
+        # Issue #375: a covariate numerically identical to x or y fully explains
+        # that variable, so the partial correlation is not estimable: NaN is
+        # returned (with the actual sample size) instead of a plausible-looking
+        # but meaningless number.
         df_375 = df.copy()
         df_375["z"] = df["y"].values
-        with pytest.raises(ValueError, match="numerically identical to y"):
-            partial_corr(data=df_375, x="x", y="y", covar="z")
+        pc = partial_corr(data=df_375, x="x", y="y", covar="z")
+        assert pc.at["pearson", "n"] == df.shape[0]
+        assert np.isnan(pc.at["pearson", "r"])
+        assert np.isnan(pc.at["pearson", "p_val"])
         df_375["z"] = df["x"].values
-        with pytest.raises(ValueError, match="numerically identical to x"):
-            partial_corr(data=df_375, x="x", y="y", covar="z")
+        pc = partial_corr(data=df_375, x="x", y="y", covar="z")
+        assert pc.at["pearson", "n"] == df.shape[0]
+        assert np.isnan(pc.at["pearson", "r"])
+        assert np.isnan(pc.at["pearson", "p_val"])
 
         # Issue #435: rank-deficient covariance matrix (perfect multicollinearity) warns
         df_435 = df.copy()
@@ -252,13 +259,20 @@ class TestCorrelation(TestCase):
             pc_normal.at["pearson", "p_val"], pc_large.at["pearson", "p_val"], atol=1e-6
         )
 
-        # A constant variable (zero variance) returns NaN instead of failing
+        # A constant variable (zero variance) has no variance left to correlate:
+        # the partial correlation is not estimable and NaN is returned
         df_const = df_normal.assign(covar_1=1.0)
         for method in ["pearson", "spearman"]:
-            for kwargs in [{"x": "covar_1", "covar": "covar_2"}, {"x": "x", "covar": "covar_1"}]:
-                stats = partial_corr(data=df_const, y="y", method=method, **kwargs)
-                assert stats.at[method, "n"] == n
-                assert np.isnan(stats.at[method, "r"])
+            stats = partial_corr(data=df_const, y="y", method=method, x="covar_1", covar="covar_2")
+            assert stats.at[method, "n"] == n
+            assert np.isnan(stats.at[method, "r"])
+            # A constant covariate carries no control information: the result is
+            # the same as without any covariate (i.e. the plain correlation)
+            stats = partial_corr(data=df_const, y="y", method=method, x="x", covar="covar_1")
+            assert stats.at[method, "n"] == n
+            ref = corr(df_const["x"], df_const["y"], method=method)
+            assert np.isclose(stats.at[method, "r"], ref.at[method, "r"])
+            assert np.isclose(stats.at[method, "p_val"], ref.at[method, "p_val"])
 
     def test_rmcorr(self):
         """Test function rm_corr"""

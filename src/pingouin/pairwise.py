@@ -6,7 +6,7 @@ from itertools import combinations, product
 import numpy as np
 import pandas as pd
 import pandas_flavor as pf
-from scipy.stats import studentized_range
+from scipy.stats import rankdata, studentized_range
 
 from .config import _no_rounding
 from .effsize import compute_effsize
@@ -1090,6 +1090,24 @@ def pairwise_corr(
     sample sizes, etc), a better alternative is to use the
     :py:func:`pingouin.pcorr` function (see example 7).
 
+    **Partial correlations and non-estimable pairs**
+
+    When ``covar`` is specified, each pair is evaluated with
+    :py:func:`pingouin.partial_corr` on its own complete observations
+    (``nan_policy='pairwise'``) or on the common complete cases
+    (``nan_policy='listwise'``); every row matches a direct call to
+    :py:func:`pingouin.partial_corr` on the same samples. As in
+    :py:func:`pingouin.partial_corr`, redundant (duplicated, proportional,
+    exactly linearly dependent or constant) covariates only count once, both
+    in the correlation coefficient and in the degrees of freedom.
+
+    A pair that is not estimable — the covariates fully explain one of the
+    two variables, a variable is constant, or fewer than 3 complete
+    observations are available — does not interrupt the scan: the row is kept
+    (with its actual ``n``) but its statistics are NaN. The multiple
+    comparison correction (``padjust``) is computed on the finite p-values
+    only, and the corrected values are mapped back to their respective rows.
+
     Examples
     --------
     1. One-sided spearman correlation corrected for multiple comparisons
@@ -1168,7 +1186,7 @@ def pairwise_corr(
     Openness           -0.01        -          ***
     Extraversion       -0.35    0.267            -
     """
-    from pingouin.correlation import corr, partial_corr
+    from pingouin.correlation import _control_space, _partial_corr_core, _partial_corr_output, corr
 
     # Check arguments
     _check_alternative(alternative)
@@ -1176,6 +1194,8 @@ def pairwise_corr(
 
     # Keep only numeric columns
     data = data._get_numeric_data()
+    num_keys = data.columns.tolist()  # all numeric columns, incl. constant ones
+    data_num = data  # keep all numeric columns for covariate extraction
     # Remove columns with constant value and/or NaN
     data = data.loc[:, data.nunique(dropna=True) >= 2]
     # Extract columns names
@@ -1228,8 +1248,11 @@ def pairwise_corr(
             covar = [covar]
         elif isinstance(covar, pd.Index):
             covar = covar.tolist()
-        # Check that columns exist and are numeric
-        assert all([c in keys for c in covar]), (
+        # Check that columns exist and are numeric. Covariates are checked
+        # against all numeric columns (not only the non-constant ones): a
+        # covariate that is constant on the whole dataframe simply carries no
+        # control information and does not invalidate the configuration.
+        assert all([c in num_keys for c in covar]), (
             "Covariate(s) are either not in data or not numeric."
         )
         # And we make sure that X or Y does not contain covar
@@ -1246,24 +1269,66 @@ def pairwise_corr(
         all_cols = list(dict.fromkeys(c for pair in combs for c in pair))
         if covar is not None:
             all_cols.extend(covar)
-        data = data[all_cols].dropna()
+        # Use data_num so that constant covariates (removed from data) are
+        # still included in the common complete-case selection.
+        data = data_num[all_cols].dropna()
+        data_num = data
 
     # Compute pairwise correlations
     results = []
     with _no_rounding():  # For max precision
-        for col1, col2 in combs:
-            if covar is None:
+        if covar is None:
+            for col1, col2 in combs:
                 cor_st = corr(
                     data[col1].to_numpy(),
                     data[col2].to_numpy(),
                     alternative=alternative,
                     method=method,
                 )
-            else:
-                cor_st = partial_corr(
-                    data=data, x=col1, y=col2, covar=covar, alternative=alternative, method=method
+                results.append(cor_st)
+        else:
+            # Partial correlations. Only pearson and spearman are supported.
+            assert method in ["pearson", "spearman"], (
+                'only "pearson" and "spearman" are supported for partial correlation.'
+            )
+            # Each pair uses its own complete observations (pairwise deletion),
+            # or the common complete cases (listwise deletion, already applied
+            # above). The control space is computed once per unique missingness
+            # pattern and reused across all pairs that share it.
+            space_cache = {}
+            for col1, col2 in combs:
+                mask = data_num[[col1, col2, *covar]].notna().all(axis=1).to_numpy()
+                n = int(mask.sum())
+                if n < 3:
+                    # Not enough complete observations for this pair: keep the
+                    # row (with its sample size) but NaN statistics, and move
+                    # on to the next pair.
+                    results.append(_partial_corr_output(n, np.nan, np.nan, np.nan, method))
+                    continue
+                key = mask.tobytes()
+                ctrl = space_cache.get(key)
+                if ctrl is None:
+                    zv = data_num.loc[mask, covar].to_numpy(dtype=float)
+                    if method == "spearman":
+                        zv = np.apply_along_axis(rankdata, 0, zv)
+                    ctrl = _control_space(zv)
+                    if ctrl[3]:  # rank_deficient
+                        warnings.warn(
+                            "The covariates are linearly dependent (rank-deficient "
+                            "control space): redundant covariates are only counted "
+                            "once in the degrees of freedom.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                    space_cache[key] = ctrl
+                xv = data_num.loc[mask, col1].to_numpy(dtype=float)
+                yv = data_num.loc[mask, col2].to_numpy(dtype=float)
+                if method == "spearman":
+                    xv, yv = rankdata(xv), rankdata(yv)
+                r, pval, ci = _partial_corr_core(
+                    xv, yv, ctrl_x=ctrl, ctrl_y=ctrl, alternative=alternative
                 )
-            results.append(cor_st)
+                results.append(_partial_corr_output(n, r, ci, pval, method))
 
     stats = pd.concat(results, ignore_index=True)
     stats.insert(0, "X", [x for x, _ in combs])
@@ -1278,6 +1343,10 @@ def pairwise_corr(
     # Multiple comparisons
     stats = stats.rename(columns={"p_val": "p_unc"})
     stats = _padjust(stats, padjust=padjust)
+    # Whether p-value adjustment columns were added (padjust != 'none' and
+    # more than one pair). They are kept even if entirely NaN (e.g. when no
+    # pair was estimable).
+    has_padj = "p_corr" in stats.columns
 
     col_order = [
         "X",
@@ -1295,8 +1364,15 @@ def pairwise_corr(
         "power",
     ]
 
-    # Reorder columns and remove empty ones
-    stats = stats.reindex(columns=col_order).dropna(how="all", axis=1)
+    # Reorder columns. The core columns (n, r, CI95, p_unc) are always kept,
+    # even when every pair is not estimable (all-NaN); only the optional
+    # columns that are entirely missing are removed.
+    stats = stats.reindex(columns=col_order)
+    drop_cols = [c for c in ["outliers", "BF10", "power"] if stats[c].isna().all()]
+    if not has_padj:
+        # No p-value adjustment was applied (padjust='none' or a single pair)
+        drop_cols += ["p_corr", "p_adjust"]
+    stats = stats.drop(columns=drop_cols)
 
     # Add covariates names if present
     if covar is not None:

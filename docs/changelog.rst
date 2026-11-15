@@ -3,6 +3,13 @@
 What's new
 ##########
 
+v0.7.1 (unreleased)
+-------------------
+
+**Bugfixes — incorrect results**
+
+- :py:func:`pingouin.partial_corr` and :py:func:`pingouin.pairwise_corr`: redundant covariates silently changed the inference, and covariates that fully explain a variable returned plausible-looking but meaningless correlations. The (semi-)partial correlation is now computed on an orthonormal basis of the control space actually spanned by the covariates (Pearson: raw values; Spearman: ranks of the observations actually used), and the degrees of freedom of the test use the effective number of control directions. As a result, adding duplicated, proportional, exactly linearly dependent or constant covariate columns — or applying any invertible linear recoding of the covariates — no longer changes ``r``, ``p_val`` or ``CI95`` (previously, e.g. controlling for ``[z]`` vs ``[z, 2*z]`` gave the same ``r`` but a different ``p_val``). When the control information fully explains a controlled variable (e.g. a covariate identical to ``x`` or ``y``, which raised a ``ValueError`` since v0.6.0), the correlation is not estimable and ``r``, ``CI95`` and ``p_val`` are now NaN (with ``n`` still reported) instead of a finite, possibly significant, value; when the residuals are estimable but the degrees of freedom are not positive, ``r`` is reported and ``p_val`` / ``CI95`` are NaN. In :py:func:`pingouin.pairwise_corr`, a non-estimable or too-small pair no longer aborts the whole call: the pair is kept as a NaN row, and the ``padjust`` correction family is formed by the finite p-values only and mapped back to the correct rows. The numerical rank of the control space is decided on the standardized covariate matrix with NumPy's default ``matrix_rank`` tolerance, so the decision is independent of the units, scale and order of the covariates.
+
 v0.7.0 (September 2026)
 -----------------------
 

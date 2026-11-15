@@ -23,6 +23,151 @@ from .utils import (
 __all__ = ["corr", "partial_corr", "pcorr", "rcorr", "rm_corr", "distance_corr"]
 
 
+def _control_space(Z):
+    """Compute an orthonormal basis of the control space spanned by covariates.
+
+    Parameters
+    ----------
+    Z : ndarray, shape (n, p)
+        Covariate values on the observations actually entering the correlation
+        (NaN-free; already rank-transformed when ``method="spearman"``).
+
+    Returns
+    -------
+    Q : ndarray, shape (n, q) or None
+        Orthonormal basis of the centered control space, or None when the
+        covariates carry no information (no column, or all constant).
+    q : int
+        Effective number of control directions, i.e. the numerical rank of the
+        covariate matrix. This is the ``k`` used in the degrees of freedom of
+        the test.
+    p : int
+        Number of covariate columns in ``Z`` (before any reduction).
+    rank_deficient : bool
+        True when at least one non-constant covariate was dropped as redundant
+        (exact or numerical linear dependence between covariates).
+
+    Notes
+    -----
+    The numerical rank is decided on the *standardized* covariate matrix
+    (centered, each non-constant column scaled to unit sample variance): a
+    singular value is kept iff it exceeds ``eps * max(n, p) * s_max``, NumPy's
+    default :py:func:`numpy.linalg.matrix_rank` tolerance. Constant covariates
+    (zero variance) carry no information beyond the intercept and are dropped
+    beforehand. Because the decision is made on standardized values, it is
+    invariant to the units, scale and order of the covariate columns.
+    """
+    Z = np.asarray(Z, dtype=float)
+    n, p = Z.shape
+    if p == 0:
+        return None, 0, 0, False
+    sd = Z.std(axis=0, ddof=1)
+    nonconst = sd > 0  # constant columns carry no control information
+    if not nonconst.any():
+        return None, 0, p, False
+    Zs = (Z[:, nonconst] - Z[:, nonconst].mean(axis=0)) / sd[nonconst]
+    U, s, _ = np.linalg.svd(Zs, full_matrices=False)
+    tol = s[0] * max(Zs.shape) * np.finfo(s.dtype).eps
+    q = int(np.count_nonzero(s > tol))
+    return U[:, :q], q, p, bool(q < Zs.shape[1])
+
+
+def _partial_corr_core(x, y, ctrl_x=None, ctrl_y=None, alternative="two-sided"):
+    """Core (semi-)partial correlation on complete-case arrays.
+
+    Parameters
+    ----------
+    x, y : ndarray, shape (n,)
+        Values of the two variables on the observations actually entering the
+        correlation (NaN-free, at least 3 samples; already rank-transformed
+        when ``method="spearman"``).
+    ctrl_x, ctrl_y : tuple (Q, q, p) or None
+        Control space removed from ``x`` / ``y``, as returned by
+        :py:func:`_control_space` (None = nothing is removed from that
+        variable). For a full partial correlation the same space is passed
+        twice; for a semi-partial correlation one of the two is None.
+    alternative : str
+        Tail of the test.
+
+    Returns
+    -------
+    r : float
+        (Semi-)partial correlation coefficient. NaN when not estimable.
+    pval : float
+        p-value. NaN when the degrees of freedom are not positive.
+    ci : ndarray or float
+        95% confidence interval. NaN when the Fisher standard error is not
+        defined (``n - q - 3 <= 0``).
+
+    Notes
+    -----
+    A variable is considered *fully explained* by its control space — and the
+    correlation not estimable — when the norm of its residual (relative to its
+    centered norm) does not exceed ``eps * max(n, p + 1) * max(q, 1)``. This
+    mirrors the rank tolerance of :py:func:`_control_space`, scaled by the
+    number of retained directions to cover the accumulation of rounding
+    errors through the successive projections. A constant variable (zero
+    centered norm) is always fully explained.
+    """
+    n = x.size
+    eps = np.finfo(float).eps
+
+    def _residual(v, ctrl):
+        Q, q, p = (None, 0, 0) if ctrl is None else ctrl[:3]
+        vc = v - v.mean()
+        nrm = np.linalg.norm(vc)
+        if nrm == 0:
+            return None  # constant variable: no variance to explain
+        if Q is not None:
+            vc = vc - Q @ (Q.T @ vc)
+        if np.linalg.norm(vc) <= eps * max(n, p + 1) * max(q, 1) * nrm:
+            return None  # fully explained by the control space
+        return vc
+
+    rx = _residual(x, ctrl_x)
+    ry = _residual(y, ctrl_y)
+    if rx is None or ry is None:
+        # The control information fully explains a controlled variable: the
+        # correlation is not estimable. Return NaN (and not a clipped +/- 1).
+        return np.nan, np.nan, np.nan
+
+    r = float(np.clip(rx @ ry / (np.linalg.norm(rx) * np.linalg.norm(ry)), -1, 1))
+
+    # Degrees of freedom use the effective number of control directions, i.e.
+    # the rank of the control space actually removed from the data.
+    ctrl = ctrl_x if ctrl_x is not None else ctrl_y
+    k = ctrl[1] if ctrl is not None else 0
+    dof = n - k - 2
+    pval = _correl_pvalue(r, n, k, alternative) if dof >= 1 else np.nan
+    if n - k - 3 > 0:
+        if abs(r) == 1:
+            ci = np.array([r, r])  # arctanh(+/- 1) is not finite
+        else:
+            # decimals=15 (instead of the historical 6) so that equivalent
+            # control-space representations agree to well below 1e-8 on the
+            # confidence interval endpoints.
+            ci = compute_esci(
+                stat=r, nx=(n - k), ny=(n - k), eftype="r", decimals=15, alternative=alternative
+            )
+    else:
+        ci = np.nan
+    return r, pval, ci
+
+
+def _partial_corr_output(n, r, ci, pval, method):
+    """Assemble the one-row output DataFrame of :py:func:`partial_corr`.
+
+    This is shared by :py:func:`partial_corr` and :py:func:`pairwise_corr` so
+    that both return identical rows. Not rounded (post-processing is applied
+    by the caller).
+    """
+    stats = pd.DataFrame(
+        {"n": n, "r": r, "CI95": [ci] if np.ndim(ci) else np.nan, "p_val": pval},
+        index=[method],
+    )
+    return stats[["n", "r", "CI95", "p_val"]]
+
+
 def _correl_pvalue(r, n, k=0, alternative="two-sided"):
     """Compute the p-value of a correlation coefficient.
 
@@ -744,15 +889,41 @@ def partial_corr(
     with the exception that the set of controlling variables is only
     removed for either ``x`` or ``y``, but not both.
 
-    Pingouin uses the method described in [2]_ to calculate the (semi)partial
-    correlation coefficients and associated p-values. This method is based on
-    the inverse covariance matrix and is significantly faster than the
-    traditional regression-based method. Results have been tested against the
+    Pingouin residualizes the variables on an orthonormal basis of the control
+    space, computed from the centered and scaled covariate matrix (Pearson:
+    raw values; Spearman: ranks of the observations actually used). Results
+    have been tested against the
     `ppcor <https://cran.r-project.org/web/packages/ppcor/index.html>`_
-    R package.
+    R package, which uses the equivalent inverse-covariance formula [2]_.
 
     .. important:: Rows with missing values are automatically removed from
         data.
+
+    **Redundant and non-informative covariates**
+
+    Only the control space actually spanned by the covariates is used, both
+    for the correlation coefficient and for the degrees of freedom of the
+    test. As a consequence, adding duplicated, proportional, exactly linearly
+    dependent or constant covariate columns — or applying any invertible
+    linear recoding of the covariates — does not change ``r``, ``p_val`` or
+    ``CI95``. A warning is emitted when non-constant covariates are linearly
+    dependent. The numerical rank is decided on the standardized covariate
+    matrix with the tolerance ``eps * max(n, p) * s_max`` (NumPy's default
+    :py:func:`numpy.linalg.matrix_rank` rule), so the decision does not depend
+    on the units, scale or order of the covariates.
+
+    **Non-estimable correlations**
+
+    When the control information fully explains a controlled variable (for a
+    full partial correlation: ``x`` or ``y``; for a semi-partial correlation:
+    only the controlled side), the correlation is not estimable and ``r``,
+    ``CI95`` and ``p_val`` are NaN (``n`` is still reported). The same holds
+    when a variable is constant, or when fewer than 3 complete observations
+    are available. When the residuals are estimable but the degrees of
+    freedom are not positive (``n - q - 2 < 1``, with ``q`` the effective
+    number of control directions), ``r`` is reported but ``p_val`` is NaN;
+    ``CI95`` is NaN whenever the Fisher standard error is not defined
+    (``n - q - 3 <= 0``).
 
     References
     ----------
@@ -834,7 +1005,6 @@ def partial_corr(
         "spearman",
     ], 'only "pearson" and "spearman" are supported for partial correlation.'
     assert isinstance(data, pd.DataFrame), "data must be a pandas DataFrame."
-    assert data.shape[0] > 2, "Data must have at least 3 samples."
     if covar is not None and (x_covar is not None or y_covar is not None):
         raise ValueError("Cannot specify both covar and {x,y}_covar.")
     if x_covar is not None and y_covar is not None:
@@ -846,101 +1016,65 @@ def partial_corr(
     else:
         assert x != covar, "x and covar must be independent"
         assert y != covar, "y and covar must be independent"
-    # Build column lists; covariates is used later for data-value checks
-    covariates = _flatten_list([covar, x_covar, y_covar])
+    # Build the list of columns used in the correlation
     col = _flatten_list([x, y, covar, x_covar, y_covar])
     # Check that columns exist
     assert all([c in data for c in col]), "columns are not in dataframe."
     # Check that columns are numeric
     assert all([data[c].dtype.kind in "bfiu" for c in col])
 
-    # Drop rows with NaN
+    # Drop rows with missing values
     data = data[col].dropna()
     n = data.shape[0]  # Number of samples
-    k = data.shape[1] - 2  # Number of covariates
-    assert n > 2, "Data must have at least 3 non-NAN samples."
+    if n < 3:
+        # Not enough complete observations to estimate a correlation: return
+        # NaN (but keep the actual sample size) instead of raising.
+        stats = _partial_corr_output(n, np.nan, np.nan, np.nan, method)
+        return _postprocess_dataframe(stats)
 
-    # Check that no covariate is numerically identical to x or y (issue #375)
-    for c in covariates:
-        if np.allclose(data[x].to_numpy(), data[c].to_numpy()):
-            raise ValueError(
-                f"Covariate '{c}' is numerically identical to x='{x}'. "
-                "Partial correlation is undefined."
-            )
-        if np.allclose(data[y].to_numpy(), data[c].to_numpy()):
-            raise ValueError(
-                f"Covariate '{c}' is numerically identical to y='{y}'. "
-                "Partial correlation is undefined."
-            )
-
-    if (data.nunique() < 2).any():
-        # A constant variable has zero variance: the partial correlation is not defined
-        return pd.DataFrame({"n": n, "r": np.nan, "CI95": np.nan, "p_val": np.nan}, index=[method])
-
-    # Calculate the partial corrrelation matrix - similar to pingouin.pcorr()
     if method == "spearman":
-        # Convert the data to rank, similar to R cov()
-        V = data.rank(na_option="keep").cov()
-    else:
-        # Standardize data before computing covariance to improve numerical stability
-        # when variables differ greatly in magnitude. Partial/semi-partial correlation
-        # is scale-invariant, so this does not affect the result. See GitHub #411, #509.
-        V = ((data - data.mean()) / data.std()).cov()
+        # The control space is defined by the ranks of the observations
+        # actually used, not by the raw values (linear dependence between raw
+        # covariates does not imply dependence between their ranks).
+        data = data.rank()
 
-    # Warn if covariance matrix is rank-deficient (issue #435)
-    if np.linalg.matrix_rank(V) < V.shape[0]:
-        warnings.warn(
-            "The covariance matrix is rank-deficient, likely due to multicollinearity "
-            "among the covariates. Partial correlation results may be unreliable.",
-            UserWarning,
-            stacklevel=2,
-        )
-
-    Vi = np.linalg.pinv(V, hermitian=True)  # Inverse covariance matrix
-    Vi_diag = Vi.diagonal()
-    D = np.diag(np.sqrt(1 / Vi_diag))
-    pcor = -1 * (D @ Vi @ D)  # Partial correlation matrix
+    # Build the control space(s): an orthonormal basis of the centered,
+    # standardized covariate matrix, reduced to its numerical rank. Redundant
+    # (duplicated, proportional, exactly linearly dependent or constant)
+    # covariates therefore do not change the results, and invertible linear
+    # recodings of the covariates leave the control space unchanged.
+    def _build_space(cov_list):
+        ctrl = _control_space(data[cov_list].to_numpy(dtype=float))
+        if ctrl[3]:  # rank_deficient
+            warnings.warn(
+                "The covariates are linearly dependent (rank-deficient control "
+                "space): redundant covariates are only counted once in the "
+                "degrees of freedom.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return ctrl
 
     if covar is not None:
-        r = pcor[0, 1]
+        ctrl_x = ctrl_y = _build_space(_flatten_list([covar]))
+    elif x_covar is not None:
+        ctrl_x, ctrl_y = _build_space(_flatten_list([x_covar])), None
+    elif y_covar is not None:
+        ctrl_x, ctrl_y = None, _build_space(_flatten_list([y_covar]))
     else:
-        # Semi-partial correlation matrix
-        with np.errstate(divide="ignore"):
-            spcor = (
-                pcor
-                / np.sqrt(np.diag(V))[..., None]
-                / np.sqrt(np.abs(Vi_diag - Vi**2 / Vi_diag[..., None])).T
-            )
-        if y_covar is not None:
-            r = spcor[0, 1]  # y_covar is removed from y
-        else:
-            r = spcor[1, 0]  # x_covar is removed from x
+        ctrl_x = ctrl_y = None
 
-    # Clip r to [-1, 1] to guard against floating-point drift from pinv
-    r = float(np.clip(r, -1, 1))
-
-    # Compute the two-sided p-value and confidence intervals
-    # https://online.stat.psu.edu/stat505/lesson/6/6.3
-    pval = _correl_pvalue(r, n, k, alternative)
-    ci = compute_esci(
-        stat=r, nx=(n - k), ny=(n - k), eftype="r", decimals=6, alternative=alternative
+    r, pval, ci = _partial_corr_core(
+        data[x].to_numpy(dtype=float),
+        data[y].to_numpy(dtype=float),
+        ctrl_x=ctrl_x,
+        ctrl_y=ctrl_y,
+        alternative=alternative,
     )
 
-    # Create dictionnary
-    stats = {
-        "n": n,
-        "r": r,
-        "CI95": [ci],
-        "p_val": pval,
-    }
-
     # Convert to DataFrame
-    stats = pd.DataFrame(stats, index=[method])
-
-    # Define order
-    col_keep = ["n", "r", "CI95", "p_val"]
-    col_order = [c for c in col_keep if c in stats.keys().tolist()]
-    return _postprocess_dataframe(stats)[col_order]
+    stats = _partial_corr_output(n, r, ci, pval, method)
+    return _postprocess_dataframe(stats)
 
 
 @pf.register_dataframe_method
