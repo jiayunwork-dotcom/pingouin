@@ -7,6 +7,7 @@ import pandas_flavor as pf
 from scipy.stats import f
 
 from .bayesian import bayesfactor_ttest
+from .config import _no_rounding
 from .distribution import _contrast_cov, _gg_epsilon, _mauchly_sphericity
 from .utils import (
     _check_alternative,
@@ -16,7 +17,15 @@ from .utils import (
     remove_na,
 )
 
-__all__ = ["ttest", "rm_anova", "anova", "welch_anova", "mixed_anova", "ancova"]
+__all__ = [
+    "ttest",
+    "sequential_ttest",
+    "rm_anova",
+    "anova",
+    "welch_anova",
+    "mixed_anova",
+    "ancova",
+]
 
 
 def ttest(x, y, paired=False, alternative="two-sided", correction="auto", r=0.707, confidence=0.95):
@@ -323,6 +332,288 @@ def ttest(x, y, paired=False, alternative="two-sided", correction="auto", r=0.70
     # Convert to dataframe
     stats = pd.DataFrame(stats, index=["T_test"])
     return _postprocess_dataframe(stats)
+
+
+def _seq_information_fraction(nx_k, ny_k, paired):
+    """Information fraction of each look, relative to the final look."""
+    nx_k = np.asarray(nx_k, float)
+    ny_k = np.asarray(ny_k, float)
+    if paired:
+        return nx_k / nx_k[-1]
+    info = nx_k * ny_k / (nx_k + ny_k)
+    return info / info[-1]
+
+
+def _check_seq_looks(looks):
+    """Validate that ``looks`` is a non-empty sequence, and return it as a list."""
+    if looks is None:
+        raise ValueError("looks must be provided.")
+    try:
+        looks = list(looks)
+    except TypeError as err:
+        raise ValueError(
+            "looks must be a sequence of integers (paired=True) or of (nx, ny) pairs."
+        ) from err
+    if len(looks) < 1:
+        raise ValueError("looks must contain at least one analysis.")
+    return looks
+
+
+def sequential_ttest(
+    x,
+    y,
+    looks,
+    paired=False,
+    alternative="two-sided",
+    correction="auto",
+    alpha=0.05,
+    spending="obf",
+):
+    """
+    Group-sequential T-test with interim analyses.
+
+    The data are analyzed several times, and the test stops as soon as an efficacy boundary is
+    crossed. The boundaries and nominal p-values are the ones returned by
+    :py:func:`sequential_bounds`, so that the overall type-I error rate is controlled at ``alpha``
+    despite the repeated testing.
+
+    Parameters
+    ----------
+    x, y : array_like
+        First and second set of observations, in arrival order. Both must be one-dimensional and
+        must not contain missing values (``NaN`` raises a ValueError).
+    looks : sequence
+        Planned analyses. If ``paired=True``, a strictly increasing sequence of positive integers
+        giving the number of pairs used at each analysis. If ``paired=False``, a sequence of
+        ``(nx, ny)`` pairs of positive integers giving the number of observations of ``x`` and
+        ``y`` used at each analysis; both components must be non-decreasing, and at least one must
+        increase at every analysis. The last analysis must not exceed the length of the data. Each
+        analysis must contain at least 2 observations per group (or at least 2 pairs).
+    paired : bool
+        Specify whether the two observations are related (i.e. repeated measures) or independent.
+    alternative : str
+        Defines the alternative hypothesis, or tail of the test. Must be one of "two-sided"
+        (default), "greater" or "less".
+    correction : str or bool
+        Passed to :py:func:`pingouin.ttest` for unpaired two-sample T-tests. If 'auto', Welch's
+        T-test is used when the sample sizes are unequal at a given analysis.
+    alpha : float
+        Overall significance level (type-I error probability), in (0, 0.5).
+    spending : str or float
+        Type-I error spending function: "obf" (default), "pocock", or a positive finite float
+        ``rho``. See :py:func:`sequential_bounds`.
+
+    Returns
+    -------
+    stats : :py:class:`pandas.DataFrame`
+        One row per analysis actually performed (analyses after the first rejection are not
+        performed and do not appear), with the columns:
+
+        * ``'look'``: analysis number, starting at 1
+        * ``'nx'``, ``'ny'``: sample sizes used at that analysis
+        * ``'T'``: T-value, as returned by :py:func:`pingouin.ttest`
+        * ``'dof'``: degrees of freedom, as returned by :py:func:`pingouin.ttest`
+        * ``'p_unc'``: uncorrected p-value, as returned by :py:func:`pingouin.ttest`
+        * ``'nominal_p'``: nominal p-value of that look, from :py:func:`sequential_bounds`
+        * ``'reject'``: whether the null hypothesis is rejected at that analysis
+
+    Notes
+    -----
+    At the ``k``-th analysis, :py:func:`pingouin.ttest` is called on the first ``n_k``
+    observations (or pairs), with the same ``paired``, ``alternative`` and ``correction``
+    arguments. The null hypothesis is rejected when ``p <= nominal_p_k``, in which case the
+    procedure stops: subsequent analyses are neither performed nor returned. The reported ``T``,
+    ``dof`` and ``p_unc`` are exactly those of that direct :py:func:`pingouin.ttest` call, and
+    ``nominal_p`` is exactly the value returned by :py:func:`sequential_bounds` for the same
+    ``alpha``, ``alternative`` and ``spending``.
+
+    The information fraction of a look is ``t_k = n_k / n_K`` for paired data, and
+
+    .. math::
+
+        t_k = \\frac{n_{x,k} n_{y,k} / (n_{x,k} + n_{y,k})}
+                    {n_{x,K} n_{y,K} / (n_{x,K} + n_{y,K})}
+
+    for independent groups, where ``K`` is the last analysis. With a single analysis, the result
+    is identical to a direct :py:func:`pingouin.ttest` call followed by a comparison of its
+    p-value with ``alpha``.
+
+    See also
+    --------
+    ttest, sequential_bounds, power_ttest, power_ttest2n
+
+    References
+    ----------
+    * Jennison, C., & Turnbull, B. W. (2000). Group Sequential Methods with Applications to
+      Clinical Trials. Chapman & Hall/CRC.
+
+    Examples
+    --------
+    Paired data, three interim analyses::
+
+        >>> import numpy as np
+        >>> from pingouin import sequential_ttest
+        >>> rng = np.random.default_rng(42)
+        >>> x = rng.normal(loc=0.3, size=60)
+        >>> y = x + rng.normal(loc=0.5, size=60)
+        >>> sequential_ttest(x, y, looks=[20, 40, 60], paired=True).round(3)
+           look  nx  ny      T   dof  p_unc  nominal_p  reject
+        0     1  20  20 -2.439  19.0  0.025      0.001   False
+        1     2  40  40 -2.365  39.0  0.023      0.016   False
+        2     3  60  60 -3.157  59.0  0.003      0.044    True
+
+    Independent groups (there is no rejection here, so all analyses are reported)::
+
+        >>> x = rng.normal(loc=0.3, size=60)
+        >>> y = rng.normal(loc=0.5, size=60)
+        >>> sequential_ttest(x, y, looks=[(20, 20), (40, 40), (60, 60)],
+        ...                  alternative="greater").round(3)
+           look  nx  ny      T    dof  p_unc  nominal_p  reject
+        0     1  20  20 -0.757   38.0  0.773      0.001   False
+        1     2  40  40 -1.381   78.0  0.914      0.016   False
+        2     3  60  60 -1.256  118.0  0.894      0.045   False
+
+    See also
+    --------
+    ttest, sequential_bounds, power_ttest, power_ttest2n
+
+    References
+    ----------
+    * Jennison, C., & Turnbull, B. W. (2000). Group Sequential Methods with Applications to
+      Clinical Trials. Chapman & Hall/CRC.
+    """
+
+    from . import sequential as _seq
+
+    _seq._check_alternative(alternative)
+    alpha = _seq._check_alpha(alpha)
+    spending = _seq._check_spending(spending)
+    paired = bool(paired)
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.ndim != 1 or y.ndim != 1:
+        raise ValueError("x and y must be one-dimensional.")
+    if np.isnan(x).any() or np.isnan(y).any():
+        raise ValueError("x and y must not contain NaN values.")
+    if paired and x.size != y.size:
+        raise ValueError("x and y must have the same length when paired=True.")
+
+    looks = _check_seq_looks(looks)
+    n_looks = len(looks)
+    sizes = []
+    if paired:
+        previous = 0
+        for k, n_k in enumerate(looks):
+            if isinstance(n_k, (bool, np.bool_)) or not isinstance(n_k, (int, np.integer)):
+                raise ValueError(
+                    "When paired=True, looks must be a strictly increasing sequence of positive "
+                    f"integers; look {k + 1} is not an integer."
+                )
+            n_k = int(n_k)
+            if n_k <= previous:
+                raise ValueError(
+                    "When paired=True, looks must be strictly increasing; "
+                    f"look {k + 1} is not greater than the previous one."
+                )
+            if n_k < 2:
+                raise ValueError(f"At least 2 pairs are required at look {k + 1}, got {n_k}.")
+            if n_k > x.size:
+                raise ValueError(
+                    f"Look {k + 1} requires {n_k} pairs but only {x.size} are available."
+                )
+            sizes.append((n_k, n_k))
+            previous = n_k
+    else:
+        previous = (0, 0)
+        for k, item in enumerate(looks):
+            try:
+                nx_k, ny_k = item
+            except (TypeError, ValueError) as err:
+                raise ValueError(
+                    "When paired=False, looks must be a sequence of (nx, ny) pairs; "
+                    f"look {k + 1} is not a pair."
+                ) from err
+            for label, n_k in (("nx", nx_k), ("ny", ny_k)):
+                if isinstance(n_k, (bool, np.bool_)) or not isinstance(n_k, (int, np.integer)):
+                    raise ValueError(
+                        "When paired=False, the sample sizes in looks must be positive integers; "
+                        f"{label} of look {k + 1} is not an integer."
+                    )
+            nx_k, ny_k = int(nx_k), int(ny_k)
+            if nx_k < 2 or ny_k < 2:
+                raise ValueError(
+                    f"At least 2 observations per group are required at look {k + 1}, "
+                    f"got nx={nx_k}, ny={ny_k}."
+                )
+            if nx_k < previous[0] or ny_k < previous[1]:
+                raise ValueError(
+                    f"The sample sizes must be non-decreasing; look {k + 1} decreases a sample "
+                    "size."
+                )
+            if nx_k == previous[0] and ny_k == previous[1]:
+                raise ValueError(f"At least one sample size must increase at look {k + 1}.")
+            if nx_k > x.size or ny_k > y.size:
+                raise ValueError(
+                    f"Look {k + 1} requires nx={nx_k}, ny={ny_k} observations but only "
+                    f"{x.size} and {y.size} are available."
+                )
+            sizes.append((nx_k, ny_k))
+            previous = (nx_k, ny_k)
+    if not paired:
+        for k, item in enumerate(looks):
+            if isinstance(item, (str, bytes)) or not hasattr(item, "__len__"):
+                raise ValueError(
+                    "When paired=False, looks must be a sequence of (nx, ny) pairs; "
+                    f"look {k + 1} is not a pair."
+                )
+            if len(item) != 2:
+                raise ValueError(
+                    "When paired=False, looks must be a sequence of (nx, ny) pairs; "
+                    f"look {k + 1} is not a pair."
+                )
+
+    nx_k = np.array([s[0] for s in sizes], dtype=float)
+    ny_k = np.array([s[1] for s in sizes], dtype=float)
+    info = _seq_information_fraction(nx_k, ny_k, paired)
+    # Guard against any floating-point drift of the last information fraction.
+    info[-1] = 1.0
+
+    bound, nominal, _ = _seq.sequential_bound_table(info, alpha, alternative, spending)
+
+    rows = []
+    for k in range(n_looks):
+        x_k, y_k = x[: sizes[k][0]], y[: sizes[k][1]]
+        with _no_rounding():
+            tt = ttest(
+                x_k,
+                y_k,
+                paired=paired,
+                alternative=alternative,
+                correction=correction,
+            )
+            p_unc = float(tt["p_val"].iloc[0])
+            t_value = float(tt["T"].iloc[0])
+            dof_value = float(tt["dof"].iloc[0])
+        reject = bool(p_unc <= nominal[k])
+        rows.append(
+            {
+                "look": k + 1,
+                "nx": sizes[k][0],
+                "ny": sizes[k][1],
+                "T": t_value,
+                "dof": dof_value,
+                "p_unc": p_unc,
+                "nominal_p": float(nominal[k]),
+                "reject": reject,
+            }
+        )
+        if reject:
+            break
+
+    return pd.DataFrame(
+        rows, columns=["look", "nx", "ny", "T", "dof", "p_unc", "nominal_p", "reject"]
+    )
 
 
 def _pivot_rm(data, dv, within, subject, between=None):

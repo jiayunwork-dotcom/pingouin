@@ -1,11 +1,13 @@
 # Author: Raphael Vallat <raphaelvallat9@gmail.com>
 # Date: April 2018
 import warnings
+from functools import lru_cache
 
 import numpy as np
 from scipy import stats
 from scipy.optimize import brenth
 
+from . import sequential as _seq
 from .utils import _check_alternative
 
 __all__ = [
@@ -15,6 +17,7 @@ __all__ = [
     "power_rm_anova",
     "power_corr",
     "power_chi2",
+    "sequential_bounds",
 ]
 
 # Bracketing interval of the Cohen d when solving for the effect size of a T-test
@@ -47,8 +50,209 @@ def _power_nct(nc, dof, alpha, alternative):
         return stats.nct.sf(tcrit, dof, nc)
 
 
+@lru_cache(maxsize=32)
+def _seq_bounds_table(t, alpha, alternative, spending):
+    """Cached sequential boundaries, nominal p-values and cumulative spending.
+
+    ``t`` is a hashable tuple of floats. The returned arrays must not be mutated by callers.
+    """
+    return _seq.sequential_bound_table(np.asarray(t, float), alpha, alternative, spending)
+
+
+def _seq_bounds_cached(t, alpha, alternative, spending):
+    """Copies of the cached sequential boundaries, nominal p-values and cumulative spending."""
+    bound, nominal, spent = _seq_bounds_table(t, float(alpha), alternative, spending)
+    return bound.copy(), nominal.copy(), spent.copy()
+
+
+def _sequential_power_ttest(d, n, t, tsample, alpha, alternative, spending):
+    """Power of a group-sequential T-test with equal (or one-sample) group sizes.
+
+    ``n`` is the sample size of the final analysis (number of pairs or number of observations in
+    each group for a two-sample test); the sample size of the ``k``-th look is ``n * t[k]``. The
+    marginal rejection probability of each look is the fixed-sample non-central T power at that
+    look and at the nominal level of the look; the dependence between looks follows the joint
+    normal distribution of the interim statistics, with correlation :math:`\\sqrt{t_j / t_k}`.
+    """
+    t = np.asarray(t, float)
+    dof = (n * t - 1) * tsample
+    if dof[0] <= 0:
+        raise ValueError(
+            "The degrees of freedom of the first analysis must be positive. Increase the sample "
+            "size or the first information fraction."
+        )
+    bound, nominal, _ = _seq_bounds_cached(tuple(t), float(alpha), alternative, spending)
+    marginal = np.array(
+        [
+            _power_nct(d * np.sqrt(nk / tsample), df, nom, alternative)
+            for nk, df, nom in zip(n * t, dof, nominal)
+        ]
+    )
+    return _seq.sequential_power(t, bound, marginal, alternative)
+
+
+def _sequential_power_ttest2n(nx, ny, d, t, alpha, alternative, spending):
+    """Power of a group-sequential two-sample T-test with unequal group sizes."""
+    t = np.asarray(t, float)
+    dof = (nx + ny) * t - 2
+    if dof[0] <= 0:
+        raise ValueError(
+            "The degrees of freedom of the first analysis must be positive. Increase the sample "
+            "sizes or the first information fraction."
+        )
+    bound, nominal, _ = _seq_bounds_cached(tuple(t), float(alpha), alternative, spending)
+    marginal = np.array(
+        [
+            _power_nct(d / np.sqrt(1 / (nx * tk) + 1 / (ny * tk)), df, nom, alternative)
+            for tk, df, nom in zip(t, dof, nominal)
+        ]
+    )
+    return _seq.sequential_power(t, bound, marginal, alternative)
+
+
+def sequential_bounds(looks, alpha=0.05, alternative="two-sided", spending="obf"):
+    """
+    Group-sequential efficacy boundaries and nominal p-values.
+
+    In a group-sequential design, the data are analyzed several times and the trial may stop as
+    soon as a boundary is crossed. Using the same nominal significance level at every look
+    inflates the overall type-I error rate well above ``alpha``. This function computes the
+    efficacy boundaries that spend ``alpha`` over the planned analyses, according to a spending
+    function.
+
+    Parameters
+    ----------
+    looks : sequence of float
+        Information fractions of the successive analyses, i.e. the proportion of the maximum
+        planned information available at each look. Must be a one-dimensional, strictly
+        increasing sequence of finite numbers in (0, 1]. The last value is typically 1.
+    alpha : float
+        Overall significance level (type-I error probability), in (0, 0.5). For a two-sided
+        alternative, ``alpha`` is the total error rate of both tails.
+    alternative : str
+        Defines the alternative hypothesis, or tail of the test. Must be one of "two-sided"
+        (default), "greater" or "less".
+    spending : str or float
+        Type-I error spending function:
+
+        * ``"obf"``: O'Brien-Fleming-like spending,
+          :math:`\\alpha(t) = 2 (1 - \\Phi(\\Phi^{-1}(1 - \\alpha / 2) / \\sqrt{t}))`
+        * ``"pocock"``: Pocock-like spending,
+          :math:`\\alpha(t) = \\alpha \\ln(1 + (e - 1) t)`
+        * a positive, finite float :math:`\\rho`: power-family spending,
+          :math:`\\alpha(t) = \\alpha t^{\\rho}`
+
+        where :math:`t` is the information fraction and :math:`\\Phi` the standard normal CDF.
+
+    Returns
+    -------
+    bounds : :py:class:`pandas.DataFrame`
+        One row per analysis, with the columns:
+
+        * ``'look'``: analysis number, starting at 1
+        * ``'t'``: information fraction
+        * ``'bound'``: efficacy boundary on the standardized Z scale. For ``"greater"`` the null
+          is rejected when :math:`Z \\geq` ``bound``; for ``"less"`` when :math:`Z \\leq`
+          ``bound`` (the boundary is negative); for ``"two-sided"`` when
+          :math:`|Z| \\geq` ``bound`` (symmetric boundaries).
+        * ``'nominal_p'``: nominal p-value of that look (one-sided for "greater"/"less",
+          two-sided for "two-sided").
+        * ``'alpha_look'``: type-I error probability spent at that look (increment).
+        * ``'alpha_spent'``: cumulative type-I error probability spent up to that look.
+
+    Notes
+    -----
+    Under the null hypothesis, the interim statistics :math:`Z_1, \\ldots, Z_K` follow a joint
+    standard normal distribution whose correlation between looks :math:`j` and :math:`k` is
+    :math:`\\sqrt{t_j / t_k}`. The boundaries are defined so that the probability of crossing for
+    the first time at look :math:`k` equals :math:`\\alpha(t_k) - \\alpha(t_{k-1})`, with
+    :math:`t_0 = 0`.
+
+    The calculation is exact up to numerical quadrature. The boundaries of a given look only
+    depend on the analyses up to that look: appending further analyses does not change the
+    boundaries of the previous ones.
+
+    The same boundaries (and nominal p-values) are used by :py:func:`power_ttest`,
+    :py:func:`power_ttest2n` and :py:func:`sequential_ttest`, which guarantees that a design
+    planned with this function has the intended type-I error rate when analyzed with
+    :py:func:`sequential_ttest`.
+
+    When only one analysis is provided, the design reduces to a fixed-sample test: ``nominal_p``,
+    ``alpha_look`` and ``alpha_spent`` are all equal to ``alpha``.
+
+    Examples
+    --------
+    O'Brien-Fleming boundaries for five equally spaced analyses (these values match the published
+    ones, e.g. Jennison & Turnbull 2000)::
+
+        >>> from pingouin import sequential_bounds
+        >>> bounds = sequential_bounds([0.2, 0.4, 0.6, 0.8, 1.0], alpha=0.025,
+        ...                            alternative="greater", spending="obf")
+        >>> bounds.round(3)
+           look    t  bound  nominal_p  alpha_look  alpha_spent
+        0     1  0.2  4.877      0.000       0.000        0.000
+        1     2  0.4  3.357      0.000       0.000        0.000
+        2     3  0.6  2.680      0.004       0.003        0.004
+        3     4  0.8  2.290      0.011       0.008        0.012
+        4     5  1.0  2.031      0.021       0.013        0.025
+
+    Pocock boundaries for the same design::
+
+        >>> sequential_bounds([0.2, 0.4, 0.6, 0.8, 1.0], alpha=0.025,
+        ...                   alternative="greater", spending="pocock").round(3)
+           look    t  bound  nominal_p  alpha_look  alpha_spent
+        0     1  0.2  2.438      0.007       0.007        0.007
+        1     2  0.4  2.427      0.008       0.006        0.013
+        2     3  0.6  2.410      0.008       0.005        0.018
+        3     4  0.8  2.397      0.008       0.004        0.022
+        4     5  1.0  2.386      0.009       0.003        0.025
+
+    See also
+    --------
+    power_ttest, power_ttest2n, sequential_ttest
+
+    References
+    ----------
+    * Jennison, C., & Turnbull, B. W. (2000). Group Sequential Methods with Applications to
+      Clinical Trials. Chapman & Hall/CRC.
+
+    * Lan, K. K. G., & DeMets, D. L. (1983). Discrete sequential boundaries for clinical trials.
+      Biometrika, 70(3), 659-663.
+    """
+    import pandas as pd
+
+    t = _seq._check_looks(looks)
+    alpha = _seq._check_alpha(alpha)
+    _seq._check_alternative(alternative)
+    spending = _seq._check_spending(spending)
+
+    # Use the same table as power_ttest / power_ttest2n / sequential_ttest (single source of truth).
+    bound, nominal, spent = _seq_bounds_cached(
+        tuple(float(v) for v in t), float(alpha), alternative, spending
+    )
+
+    alpha_look = np.diff(np.concatenate([[0.0], spent]))
+    return pd.DataFrame(
+        {
+            "look": np.arange(1, t.size + 1),
+            "t": t,
+            "bound": bound,
+            "nominal_p": nominal,
+            "alpha_look": alpha_look,
+            "alpha_spent": spent,
+        }
+    )
+
+
 def power_ttest(
-    d=None, n=None, power=None, alpha=0.05, contrast="two-samples", alternative="two-sided"
+    d=None,
+    n=None,
+    power=None,
+    alpha=0.05,
+    contrast="two-samples",
+    alternative="two-sided",
+    looks=None,
+    spending="obf",
 ):
     """
     Evaluate power, sample size, effect size or significance level of a one-sample T-test,
@@ -73,6 +277,16 @@ def power_ttest(
     alternative : string
         Defines the alternative hypothesis, or tail of the test. Must be one of
         "two-sided" (default), "greater" or "less".
+    looks : sequence of float, optional
+        Information fractions of a group-sequential design (interim analyses), e.g.
+        ``[0.25, 0.5, 0.75, 1.0]``. If None (default), a fixed-sample design is used and the
+        function behaves exactly as before. If provided, must be a one-dimensional, strictly
+        increasing sequence of finite numbers in (0, 1] whose **last value is exactly 1**; the
+        sequential power is then computed (see Notes).
+    spending : str or float
+        Type-I error spending function used when ``looks`` is not None (ignored otherwise). Must
+        be "obf" (default), "pocock", or a positive finite float ``rho``. See
+        :py:func:`sequential_bounds` for the formulas.
 
     Notes
     -----
@@ -118,6 +332,25 @@ def power_ttest(
     :py:func:`scipy.optimize.brenth` is used to solve power equations for other variables (i.e.
     sample size, effect size, or significance level). If the solving fails, a nan value is
     returned.
+
+    **Group-sequential designs.** When ``looks`` is provided, ``n`` still refers to the sample size
+    of the *final* analysis (or to the sample size of each group for a two-sample test). The
+    sample size of the ``k``-th analysis is ``n * looks[k]`` (which may be non-integer). The
+    efficacy boundaries and nominal p-values are obtained from :py:func:`sequential_bounds` with
+    the same ``alpha``, ``alternative`` and ``spending``. The test performed at the ``k``-th
+    analysis is the usual fixed-sample T-test at that look, declared significant when its p-value
+    is at most the nominal p-value of the look. The sequential power is the probability of
+    rejecting the null hypothesis at *any* look. It is computed by combining:
+
+    * the marginal rejection probability of each look, which is exactly the fixed-sample T-test
+      power (non-central T distribution, same degrees of freedom and ``alternative``) evaluated at
+      the nominal level of that look and at the sample size of that look, and
+    * the dependence between looks, via the joint normal distribution of the standardized
+      statistics with correlation :math:`\\sqrt{t_j / t_k}`.
+
+    For a two-sided alternative, rejection in either tail counts and ``d`` is taken in absolute
+    value, as in the fixed-sample case. With a single look (``looks=[1]``), the result is identical
+    to the fixed-sample calculation (``looks=None``).
 
     Results have been tested against GPower and the
     `pwr <https://cran.r-project.org/web/packages/pwr/pwr.pdf>`_ R package.
@@ -170,25 +403,67 @@ def power_ttest(
     if power is not None:
         assert 0 < power <= 1
 
+    t = None
+    if looks is not None:
+        # Group-sequential design: validate the design before doing anything else.
+        t = _seq._check_looks(looks, require_last_one=True)
+        spending = _seq._check_spending(spending)
+        if alpha is not None:
+            alpha = _seq._check_alpha(alpha)
+        if t.size == 1:
+            # A single look is a fixed-sample design: use the exact same code path, so that the
+            # results are bit-for-bit identical to ``looks=None``.
+            t = None
+        elif n is not None and (n * t[0] - 1) * tsample <= 0:
+            # Validate the first analysis degrees of freedom when the final size is known.
+            raise ValueError(
+                "The degrees of freedom of the first analysis must be positive. Increase the "
+                "sample size or the first information fraction."
+            )
+
     def func(d, n, alpha):
-        return _power_nct(d * np.sqrt(n / tsample), (n - 1) * tsample, alpha, alternative)
+        if t is None:
+            return _power_nct(d * np.sqrt(n / tsample), (n - 1) * tsample, alpha, alternative)
+        return _sequential_power_ttest(d, n, t, tsample, alpha, alternative, spending)
+
+    def check_dof(n):
+        """Raise if the first analysis of a sequential design has non-positive degrees of freedom."""
+        if t is not None and (n * t[0] - 1) * tsample <= 0:
+            raise ValueError(
+                "The degrees of freedom of the first analysis must be positive. Increase the "
+                "sample size or the first information fraction."
+            )
 
     # Evaluate missing variable
     if power is None:
         # Compute achieved power given d, n and alpha
+        check_dof(n)
         return func(d, n, alpha)
     elif n is None:
         # Compute required sample size given d, power and alpha
-        return _solve(lambda n: func(d, n, alpha) - power, 2 + 1e-10, 1e07)
+        if t is None:
+            return _solve(lambda n: func(d, n, alpha) - power, 2 + 1e-10, 1e07)
+        # Search only in the range where the first analysis has positive degrees of freedom.
+        # The lower bound is chosen so that the first analysis has at least one degree of freedom
+        # (well above the degenerate dof -> 0 regime) and at least two observations.
+        n_lo = max(2 + 1e-10, (2 + 1e-10) / t[0])
+        return _solve(lambda n: func(d, n, alpha) - power, n_lo, 1e07)
     elif d is None:
         # Compute achieved d given sample size, power and alpha level
+        check_dof(n)
         return _solve(lambda d: func(d, n, alpha) - power, *_D_BOUNDS[alternative])
     else:
         # Compute achieved alpha (significance) level given d, n and power
-        return _solve(lambda alpha: func(d, n, alpha) - power, 1e-10, 1 - 1e-10)
+        if t is None:
+            return _solve(lambda alpha: func(d, n, alpha) - power, 1e-10, 1 - 1e-10)
+        check_dof(n)
+        # For a sequential design, alpha must lie in (0, 0.5).
+        return _solve(lambda alpha: func(d, n, alpha) - power, 1e-10, 0.5 - 1e-10)
 
 
-def power_ttest2n(nx, ny, d=None, power=None, alpha=0.05, alternative="two-sided"):
+def power_ttest2n(
+    nx, ny, d=None, power=None, alpha=0.05, alternative="two-sided", looks=None, spending="obf"
+):
     """
     Evaluate power, effect size or  significance level of an independent two-samples T-test
     with unequal sample sizes.
@@ -207,6 +482,16 @@ def power_ttest2n(nx, ny, d=None, power=None, alpha=0.05, alternative="two-sided
     alternative : string
         Defines the alternative hypothesis, or tail of the test. Must be one of "two-sided"
         (default), "greater" or "less".
+    looks : sequence of float, optional
+        Information fractions of a group-sequential design (interim analyses), e.g.
+        ``[0.25, 0.5, 0.75, 1.0]``. If None (default), a fixed-sample design is used and the
+        function behaves exactly as before. If provided, must be a one-dimensional, strictly
+        increasing sequence of finite numbers in (0, 1] whose **last value is exactly 1**; the
+        sequential power is then computed (see Notes).
+    spending : str or float
+        Type-I error spending function used when ``looks`` is not None (ignored otherwise). Must
+        be "obf" (default), "pocock", or a positive finite float ``rho``. See
+        :py:func:`sequential_bounds` for the formulas.
 
     Notes
     -----
@@ -246,16 +531,22 @@ def power_ttest2n(nx, ny, d=None, power=None, alpha=0.05, alternative="two-sided
     sample size, effect size, or significance level). If the solving fails, a nan value is
     returned.
 
+    **Group-sequential designs.** When ``looks`` is provided, ``nx`` and ``ny`` still refer to the
+    sample sizes of the *final* analysis. The sample sizes of the ``k``-th analysis are
+    ``nx * looks[k]`` and ``ny * looks[k]``. The efficacy boundaries and nominal p-values come
+    from :py:func:`sequential_bounds` with the same ``alpha``, ``alternative`` and ``spending``;
+    each analysis is the usual fixed-sample T-test at that look, declared significant when its
+    p-value is at most the nominal p-value of the look. The sequential power is the probability of
+    rejecting the null hypothesis at *any* look. Its marginal probabilities are the fixed-sample
+    non-central T powers at each look (see :py:func:`power_ttest`), combined through the joint
+    normal distribution of the interim statistics. With a single look (``looks=[1]``), the result
+    is identical to the fixed-sample calculation (``looks=None``).
+
     Results have been tested against GPower and the
     `pwr <https://cran.r-project.org/web/packages/pwr/pwr.pdf>`_ R package.
 
     Examples
     --------
-    1. Compute achieved power of a T-test given ``d``, ``n`` and ``alpha``
-
-    >>> from pingouin import power_ttest2n
-    >>> print("power: %.4f" % power_ttest2n(nx=20, ny=15, d=0.5, alternative="greater"))
-    power: 0.4164
 
     2. Compute achieved ``d`` given ``n``, ``power`` and ``alpha`` level
 
@@ -281,8 +572,35 @@ def power_ttest2n(nx, ny, d=None, power=None, alpha=0.05, alternative="two-sided
     if power is not None:
         assert 0 < power <= 1
 
+    t = None
+    if looks is not None:
+        # Group-sequential design: validate the design before doing anything else.
+        t = _seq._check_looks(looks, require_last_one=True)
+        spending = _seq._check_spending(spending)
+        if alpha is not None:
+            alpha = _seq._check_alpha(alpha)
+        if t.size == 1:
+            # A single look is a fixed-sample design: use the exact same code path, so that the
+            # results are bit-for-bit identical to ``looks=None``.
+            t = None
+        elif (nx + ny) * t[0] - 2 <= 0:
+            raise ValueError(
+                "The degrees of freedom of the first analysis must be positive. Increase the "
+                "sample sizes or the first information fraction."
+            )
+
     def func(d, alpha):
-        return _power_nct(d * (1 / np.sqrt(1 / nx + 1 / ny)), nx + ny - 2, alpha, alternative)
+        if t is None:
+            return _power_nct(d * (1 / np.sqrt(1 / nx + 1 / ny)), nx + ny - 2, alpha, alternative)
+        return _sequential_power_ttest2n(nx, ny, d, t, alpha, alternative, spending)
+
+    def check_dof():
+        """Raise if the first analysis has non-positive degrees of freedom."""
+        if t is not None and (nx + ny) * t[0] - 2 <= 0:
+            raise ValueError(
+                "The degrees of freedom of the first analysis must be positive. Increase the "
+                "sample sizes or the first information fraction."
+            )
 
     # Evaluate missing variable
     if power is None:
@@ -290,10 +608,15 @@ def power_ttest2n(nx, ny, d=None, power=None, alpha=0.05, alternative="two-sided
         return func(d, alpha)
     elif d is None:
         # Compute achieved d given sample size, power and alpha level
+        check_dof()
         return _solve(lambda d: func(d, alpha) - power, *_D_BOUNDS[alternative])
     else:
         # Compute achieved alpha (significance) level given d, n and power
-        return _solve(lambda alpha: func(d, alpha) - power, 1e-10, 1 - 1e-10)
+        if t is None:
+            return _solve(lambda alpha: func(d, alpha) - power, 1e-10, 1 - 1e-10)
+        check_dof()
+        # For a sequential design, alpha must lie in (0, 0.5).
+        return _solve(lambda alpha: func(d, alpha) - power, 1e-10, 0.5 - 1e-10)
 
 
 def power_anova(eta_squared=None, k=None, n=None, power=None, alpha=0.05):

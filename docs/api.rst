@@ -22,6 +22,7 @@ ANOVA and T-test
     welch_anova
     tost
     ttest
+    sequential_ttest
     ptests
 
 Bayesian
@@ -197,6 +198,7 @@ Power analysis
       power_corr
       power_ttest
       power_ttest2n
+      sequential_bounds
 
 Reliability and consistency
 ---------------------------
